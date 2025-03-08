@@ -1,0 +1,200 @@
+---
+- name: Ensure dependencies are installed
+  apt:
+    name: ["wget", "unzip", "rsync", "gnupg2"]
+    state: present
+    update_cache: yes
+
+- name: Ensure gnupg is installed
+  ansible.builtin.apt:
+    name: gnupg
+    state: present
+
+- name: Add Amazon Corretto GPG key
+  ansible.builtin.shell: |
+    wget -O - https://apt.corretto.aws/corretto.key | gpg --dearmor -o /usr/share/keyrings/corretto-keyring.gpg
+  args:
+    creates: /usr/share/keyrings/corretto-keyring.gpg
+
+- name: Add Amazon Corretto APT repository
+  ansible.builtin.shell: |
+    echo "deb [signed-by=/usr/share/keyrings/corretto-keyring.gpg] https://apt.corretto.aws stable main" | tee /etc/apt/sources.list.d/corretto.list
+  args:
+    creates: /etc/apt/sources.list.d/corretto.list
+
+- name: Update apt package list
+  ansible.builtin.apt:
+    update_cache: yes
+
+- name: Install Amazon Corretto 8
+  ansible.builtin.apt:
+    name: java-1.8.0-amazon-corretto-jdk
+    state: present
+
+- name: Create Tomcat group
+  group:
+    name: "{{ tomcat_group }}"
+    state: present
+
+- name: Create Tomcat user
+  user:
+    name: "{{ tomcat_user }}"
+    group: "{{ tomcat_group }}"
+    home: "{{ base_install_dir }}/{{ env }}"
+    shell: /bin/false
+    system: yes
+
+- name: Download Tomcat archive (tar.gz version)
+  get_url:
+    url: "https://dlcdn.apache.org/tomcat/tomcat-9/v{{ tomcat_version }}/bin/apache-tomcat-{{ tomcat_version }}.zip"
+    dest: "/tmp/apache-tomcat-{{ tomcat_version }}.zip"
+    mode: '0644'
+
+- name: Extract Tomcat ZIP archive
+  command:
+    cmd: "unzip -q /tmp/apache-tomcat-{{ tomcat_version }}.zip -d {{ base_install_dir }}/{{ env }}"
+  args:
+    creates: "{{ base_install_dir }}/{{ env }}/apache-tomcat-{{ tomcat_version }}"
+
+- name: Rename extracted Tomcat directory
+  command:
+    cmd: "mv {{ base_install_dir }}/{{ env }}/apache-tomcat-{{ tomcat_version }} {{ base_install_dir }}/{{ env }}/apache-tomcat"
+  args:
+    removes: "{{ base_install_dir }}/{{ env }}/apache-tomcat-{{ tomcat_version }}"
+    creates: "{{ base_install_dir }}/{{ env }}/apache-tomcat"
+
+- name: Create Tomcat instance directories
+  file:
+    path: "{{ base_install_dir }}/{{ env }}/{{ item.name }}"
+    state: directory
+    owner: "{{ tomcat_user }}"
+    group: "{{ tomcat_group }}"
+    mode: '0755'
+  loop: "{{ tomcat_instances }}"
+
+- name: Copy Tomcat base directory for each instance
+  command:
+    cmd: "rsync -a {{ base_install_dir }}/{{ env }}/apache-tomcat/ {{ base_install_dir }}/{{ env }}/{{ item.name }}/"
+  loop: "{{ tomcat_instances }}"
+
+
+- name: Ensure conf directory exists
+  file:
+    path: "{{ base_install_dir }}/{{ env }}/{{ item.name }}/conf"
+    state: directory
+    owner: "{{ tomcat_user }}"
+    group: "{{ tomcat_group }}"
+    mode: '0755'
+  loop: "{{ tomcat_instances }}"
+
+- name: Copy default server.xml for each instance
+  copy:
+    src: "{{ base_install_dir }}/{{ env }}/apache-tomcat/conf/server.xml"  # Fixed source path
+    dest: "{{ base_install_dir }}/{{ env }}/{{ item.name }}/conf/server.xml"
+    remote_src: yes
+    owner: "{{ tomcat_user }}"
+    group: "{{ tomcat_group }}"
+    mode: '0644'
+  loop: "{{ tomcat_instances }}"
+
+- name: Replace HTTP connector port 8080 to {{ item.port }}
+  replace:
+    path: "{{ base_install_dir }}/{{ env }}/{{ item.name }}/conf/server.xml"
+    regexp: 'port="8080"'
+    replace: 'port="{{ item.port }}"'
+  loop: "{{ tomcat_instances }}"
+
+- name: Replace HTTP shutdown port 8005 to {{ item.port }}
+  replace:
+    path: "{{ base_install_dir }}/{{ env }}/{{ item.name }}/conf/server.xml"
+    regexp: 'port="8005"'
+    replace: 'port="{{ item.shutdown_port }}"'
+  loop: "{{ tomcat_instances }}"
+
+- name: Add or update ENV_TYPE variable in setenv.sh
+  ansible.builtin.lineinfile:
+    path: "{{ base_install_dir }}/{{ env }}/{{ item.name }}/bin/setenv.sh"
+    line: 'export ENV_TYPE={{ env }}'
+    create: yes
+    state: present
+    mode: '0755'
+  loop: "{{ tomcat_instances }}"
+
+- name: Create systemd service for Tomcat instance
+  copy:
+    dest: "/etc/systemd/system/tomcat-{{ item.name }}.service"
+    content: |
+      [Unit]
+      Description=Tomcat Server - {{ item.name }}
+      After=syslog.target network.target
+
+      [Service]
+      Type=forking
+      User={{ tomcat_user }}
+      Group={{ tomcat_group }}
+      RestartSec=10
+      Restart=on-failure
+      Environment=JAVA_HOME=/usr/lib/jvm/java-1.8.0-amazon-corretto
+      Environment='JAVA_OPTS=-Djava.awt.headless=true'
+      Environment=CATALINA_HOME={{ base_install_dir }}/{{ env }}/{{ item.name }}
+      Environment=CATALINA_BASE={{ base_install_dir }}/{{ env }}/{{ item.name }}
+      Environment=CATALINA_PID={{ base_install_dir }}/{{ env }}/{{ item.name }}/temp/tomcat.pid
+      Environment='CATALINA_OPTS={{ item. catalina_opts}}'
+      ExecStart={{ base_install_dir }}/{{ env }}/{{ item.name }}/bin/catalina.sh start
+      ExecStop={{ base_install_dir }}/{{ env }}/{{ item.name }}/bin/catalina.sh stop
+
+      [Install]
+      WantedBy=multi-user.target
+    mode: '0644'
+  loop: "{{ tomcat_instances }}"
+
+- name: Reload systemd
+  command: systemctl daemon-reload
+
+- name: Backup existing context.xml
+  copy:
+    src: "{{ base_install_dir }}/{{ env }}/{{ item.name }}/conf/context.xml"
+    dest: "{{ base_install_dir }}/{{ env }}/{{ item.name }}/conf/context.bak"
+    remote_src: yes
+  loop: "{{ tomcat_instances }}"
+
+- name: Deploy new context.xml from template
+  template:
+    src: context.xml.j2
+    dest: "{{ base_install_dir }}/{{ env }}/{{ item.name }}/conf/context.xml"
+    owner: tomcat
+    group: tomcat
+    mode: '0644'
+  loop: "{{ tomcat_instances }}"
+  notify: Restart Tomcat
+
+- name: Ensure tomcat owns all directories under /opt/tomcat
+  file:
+    path: "{{ base_install_dir }}/{{ env }}/{{ item.name }}"
+    state: directory
+    owner: "{{ tomcat_user }}"
+    group: "{{ tomcat_user }}"
+    recurse: yes
+  loop: "{{ tomcat_instances }}"
+- name: Ensure scripts in bin/ are executable
+  file:
+    path: "{{ base_install_dir }}/{{ env }}/{{ item.name }}"
+    state: directory
+    mode: "0775"
+    recurse: yes
+  loop: "{{ tomcat_instances }}"
+- name: Ensure log is writable
+  file:
+    path: "{{ base_install_dir }}/{{ env }}/{{ item.name }}/logs"
+    state: directory
+    mode: "0777"
+    recurse: yes
+  loop: "{{ tomcat_instances }}"
+- name: Enable and start Tomcat instance
+  systemd:
+    name: "tomcat-{{ item.name }}"
+    enabled: yes
+    state: started
+  loop: "{{ tomcat_instances }}"
+
+

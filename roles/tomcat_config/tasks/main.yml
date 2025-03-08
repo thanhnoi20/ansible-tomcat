@@ -1,0 +1,6 @@
+- name: install tomcat
+  include_tasks: tomcat.yml
+- name: update cli
+  include_tasks: cli.yml
+- name: update node
+  include_tasks: node.yml
