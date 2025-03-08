@@ -1,0 +1,201 @@
+---
+- name: Install Promtail and Node Exporter on Debian servers
+  hosts: all
+  become: true
+  vars:
+    env: "{ env }"  # Replace with your actual instance name
+
+  tasks:
+    - name: Set hostname
+      command: hostnamectl set-hostname "{{ env }}"
+
+    - name: Set timezone
+      command: timedatectl set-timezone Asia/Ho_Chi_Minh
+
+    - name: Create swapfile
+      command: dd if=/dev/zero of=/swapfile bs=128M count=16
+      when: ansible_facts['ansible_swap'] is not defined
+
+    - name: Set swapfile permissions
+      file:
+        path: /swapfile
+        mode: '0600'
+        state: file
+
+    - name: Make swapfile
+      command: mkswap /swapfile
+      when: ansible_facts['ansible_swap'] is not defined
+
+    - name: Enable swap
+      command: swapon /swapfile
+
+    - name: Add swapfile to fstab
+      lineinfile:
+        path: /etc/fstab
+        line: "/swapfile swap swap defaults 0 0"
+        create: yes
+
+    - name: Create Promtail directory
+      file:
+        path: /opt/promtail
+        state: directory
+
+    - name: Add Promtail user
+      user:
+        name: promtail
+        system: yes
+
+    - name: Add Node Exporter user
+      user:
+        name: node_exporter
+        system: yes
+        create_home: no
+
+    - name: Add admin user to tomcat group
+      user:
+        name: admin
+        groups: tomcat
+        append: yes
+
+    - name: Add Promtail user to tomcat group
+      user:
+        name: promtail
+        groups: tomcat
+        append: yes
+
+    - name: Download Promtail zip
+      get_url:
+        url: "https://github.com/grafana/loki/releases/download/v2.4.1/promtail-linux-amd64.zip"
+        dest: /tmp/promtail-linux-amd64.zip
+
+    - name: Unzip Promtail
+      unarchive:
+        src: /tmp/promtail-linux-amd64.zip
+        dest: /tmp/
+        remote_src: yes
+
+    - name: Set Promtail binary permissions
+      file:
+        path: /tmp/promtail-linux-amd64
+        mode: '0755'
+
+    - name: Move Promtail binary to /usr/local/bin/
+      command: mv /tmp/promtail-linux-amd64 /usr/local/bin/promtail-linux-amd64
+
+    - name: Create Promtail configuration file
+      copy:
+        dest: /opt/promtail/promtail.yml
+        content: |
+          server:
+            http_listen_port: 9080
+            grpc_listen_port: 0
+
+          positions:
+            filename: /opt/promtail/positions.yaml
+
+          clients:
+            - url: http://10.195.1.50:3100/loki/api/v1/push
+
+          scrape_configs:
+            - job_name: "{{ env }}"
+              static_configs:
+                - targets: ['localhost']
+                  labels:
+                    environment: prod-linux
+                    service: "{{ env }}"
+                    severity: catalina
+                    __path__: '/opt/tomcat/{{ env }}/logs/catalina.*'
+                - targets: ['localhost']
+                  labels:
+                    environment: prod-linux
+                    service: "{{ env }}"
+                    severity: info
+                    __path__: '/opt/tomcat/{{ env }}/logs/info.*'
+                - targets: ['localhost']
+                  labels:
+                    environment: prod-linux
+                    service: "{{ env }}"
+                    severity: error
+                    __path__: '/opt/tomcat/{{ env }}/logs/error.*'
+          pipeline_stages:
+            - multiline:
+                firstline: '^\d{4}-\d{2}-\d{2}\s+\d{2}:\d{2}:\d{2}\s+$'
+                max_lines: 128
+                timeout: 10s
+                source: msg
+            - drop:
+                equals: /^\s*$/
+                source: msg
+
+    - name: Create Promtail systemd service
+      copy:
+        dest: /etc/systemd/system/promtail.service
+        content: |
+          [Unit]
+          Description=Promtail service
+          After=network.target
+
+          [Service]
+          Type=simple
+          User=promtail
+          ExecStart=/usr/local/bin/promtail-linux-amd64 -config.file /opt/promtail/promtail.yml
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start Promtail service
+      systemd:
+        name: promtail
+        enabled: yes
+        state: started
+
+    - name: Download Node Exporter tarball
+      get_url:
+        url: "https://github.com/prometheus/node_exporter/releases/download/v1.0.1/node_exporter-1.0.1.linux-amd64.tar.gz"
+        dest: /tmp/node_exporter-1.0.1.linux-amd64.tar.gz
+
+    - name: Extract Node Exporter tarball
+      unarchive:
+        src: /tmp/node_exporter-1.0.1.linux-amd64.tar.gz
+        dest: /tmp/
+        remote_src: yes
+
+    - name: Move Node Exporter binary to /usr/local/bin/
+      command: mv /tmp/node_exporter-1.0.1.linux-amd64/node_exporter /usr/local/bin/node_exporter
+
+    - name: Clean up Node Exporter tarball and directory
+      file:
+        path: "/tmp/node_exporter-1.0.1.linux-amd64"
+        state: absent
+
+    - name: Create Node Exporter systemd service
+      copy:
+        dest: /etc/systemd/system/node-exporter.service
+        content: |
+          [Unit]
+          Description=Prometheus Node Exporter Service
+          After=network.target
+
+          [Service]
+          User=node_exporter
+          Group=node_exporter
+          Type=simple
+          ExecStart=/usr/local/bin/node_exporter
+
+          [Install]
+          WantedBy=multi-user.target
+
+    - name: Reload systemd
+      systemd:
+        daemon_reload: yes
+
+    - name: Enable and start Node Exporter service
+      systemd:
+        name: node-exporter
+        enabled: yes
+        state: started
+

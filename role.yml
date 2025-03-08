@@ -1,0 +1,6 @@
+---
+- name: Apply Tomcat Configuration
+  hosts: all
+  become: true
+  roles:
+    - tomcat_config
